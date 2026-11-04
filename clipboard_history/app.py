@@ -1,0 +1,290 @@
+"""상주 프로그램 본체: Win32 스레드의 이벤트를 메인(tk) 스레드에서 처리한다."""
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import logging
+import os
+import queue
+import time
+import tkinter as tk
+from pathlib import Path
+
+from . import win32
+from .config import Config, instance_tag, window_title
+from .filters import SearchIndex, Snapshot, compile_patterns, menu_label, should_store
+from .icons import ensure_icons
+from .store import Entry, Store
+from .ui import SearchWindow
+
+log = logging.getLogger(__name__)
+
+POLL_MS = 100
+PURGE_MS = 3600 * 1000
+DUP_WINDOW = 0.5   # 앱이 한 번 복사에 클립보드를 두 번 쓰는 경우(Chrome, Excel 등)를 한 번으로 친다
+MAX_PENDING_CLIPS = 64  # 저장이 밀릴 때 쌓아 둘 클립보드 이벤트 상한(큰 이미지가 연달아 오면 메모리 보호)
+
+
+class App:
+    def __init__(self, folder: Path, cfg: Config, warnings: list[str] | None = None):
+        self.folder = folder
+        self.cfg = cfg
+        self.paused = False
+        self.notices: list[str] = list(warnings or [])
+        self.patterns = compile_patterns(cfg.exclude_patterns)
+        if len(self.patterns) != len(cfg.exclude_patterns):
+            self.notices.append("exclude_patterns 중 잘못된 정규식이 있어 그 패턴은 쓰지 않습니다.")
+        self.events: queue.Queue = queue.Queue()
+        self._last_sig: tuple | None = None
+        self._last_sig_at = 0.0
+
+        self.store = Store(folder, allow_recover=True)
+        self._clock = (time.time(), time.monotonic())
+        if self.store.recovered_from:
+            self.notices.append("저장소 키를 복호화할 수 없어 새로 시작했습니다. 이전 파일은 *.broken-* 로 보관했습니다.")
+        self._purge()
+        self.index = SearchIndex(self.store.load_all())
+        log.info("기록 불러옴: %d개", len(self.index))
+
+        icon, paused_icon = ensure_icons(folder)
+        self.host = win32.NativeHost(window_title(folder), self._emit, cfg.hotkey,
+                                     str(icon), str(paused_icon), cfg.max_chars, cfg.max_bytes,
+                                     cfg.exclude_processes)
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.report_callback_exception = self._tk_error
+        self.window = SearchWindow(self.root, self.index, self.copy_entry, self.delete_entry,
+                                   self.toggle_pin, self.store.thumb, str(icon),
+                                   retention_days=cfg.retention_days)
+
+    def _emit(self, kind: str, payload) -> None:
+        if kind == "clip" and self.events.qsize() >= MAX_PENDING_CLIPS:
+            log.warning("처리 대기 중인 복사가 너무 많아 하나를 건너뜀")
+            return
+        self.events.put((kind, payload))  # quit 등 제어 이벤트는 항상 넣는다
+
+    def _tk_error(self, exc, val, tb) -> None:
+        log.error("UI 오류", exc_info=(exc, val, tb))
+
+    # ---- 실행
+    def run(self) -> None:
+        self.host.start()
+        self._push_recent()
+        self.root.after(POLL_MS, self._poll)
+        self.root.after(PURGE_MS, self._hourly)
+        log.info("시작 (단축키 %s)", self.host.hotkey_label or "없음")
+        for note in self.notices:
+            log.warning(note)
+        if self.notices:
+            self.root.after(1500, lambda: self.host.balloon("클립보드 기록", " ".join(self.notices)[:250]))
+        try:
+            self.root.mainloop()
+        finally:
+            self.host.stop()
+            self.store.close()
+            log.info("종료")
+
+    def _poll(self) -> None:
+        try:
+            for _ in range(200):
+                try:
+                    kind, payload = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "quit":
+                    self.root.quit()
+                    return
+                try:
+                    self._handle(kind, payload)
+                except Exception:  # 이벤트 하나가 실패해도 기록은 계속돼야 한다
+                    log.exception("이벤트 처리 실패: %s", kind)
+        finally:
+            self.root.after(POLL_MS, self._poll)
+
+    def _clock_jumped(self) -> bool:
+        """실행 중에 벽시계가 실제 흐른 시간(monotonic)보다 하루 넘게 앞서가면 시계가 튄 것으로 본다."""
+        wall0, mono0 = self._clock
+        return (time.time() - wall0) - (time.monotonic() - mono0) > 86400
+
+    def _purge(self) -> list[int]:
+        if getattr(self, "_clock", None) and self._clock_jumped():
+            if not getattr(self, "_clock_warned", False):
+                self._clock_warned = True
+                log.warning("PC 시계가 크게 앞으로 바뀌어 이번 실행 동안 자동 정리를 멈춥니다")
+                self.host.balloon("클립보드 기록", "PC 시계가 크게 바뀌어 오래된 기록 자동 정리를 잠시 멈췄습니다. 다시 시작하면 재개됩니다.")
+            return []
+        purged = self.store.purge(self.cfg.retention_days)
+        if purged:
+            log.info("보존 기간 경과 항목 삭제: %d개", len(purged))
+        return purged
+
+    def _hourly(self) -> None:
+        try:
+            purged = self._purge()
+            for eid in purged:
+                self.index.remove(eid)
+            if purged:
+                self._changed()
+        except Exception:
+            log.exception("정기 정리 실패")
+        finally:
+            self.root.after(PURGE_MS, self._hourly)
+
+    def _handle(self, kind: str, payload) -> None:
+        if kind == "clip":
+            self.on_clip(payload)
+        elif kind == "open":
+            self.window.show(payload)
+        elif kind == "recent":
+            e = self.index.get(payload)
+            if e:
+                self.copy_entry(e, False, None)
+        elif kind == "menu":
+            self.on_menu(payload)
+        elif kind == "pause":
+            paused, auto_resume = payload
+            self.set_paused(paused, auto_resume)
+        elif kind == "hotkey_failed":
+            wanted, bad = payload
+            label = self.host.hotkey_label
+            if bad:
+                msg = f"config.json 의 단축키 '{wanted}' 를 이해하지 못했습니다."
+            else:
+                msg = f"'{wanted}' 를 다른 프로그램이 쓰고 있습니다."
+            msg += f" {label} 로 대신 등록했습니다." if label else " 트레이 아이콘을 클릭해 여세요."
+            self.host.balloon("클립보드 기록", msg)
+
+    def on_clip(self, snap: Snapshot, retry: bool = True) -> None:
+        if self.paused:
+            return
+        if snap.skip_reason == "open_failed" and retry:
+            # 다른 프로그램이 클립보드를 오래 쥐고 있었다. 잠시 뒤 한 번 더 읽는다.
+            self.root.after(300, lambda: self.on_clip(
+                win32.read_clipboard(self.host.hwnd, self.cfg.max_chars, self.cfg.max_bytes,
+                                     self.host.exclude_processes), retry=False))
+            return
+        reason = should_store(snap, self.cfg.exclude_processes, self.patterns)
+        if reason:
+            if reason not in ("no_text", "unsupported"):
+                log.info("저장 안 함: %s", reason)
+            return
+        h = hashlib.blake2b(snap.kind.encode() + snap.text.encode("utf-8", "surrogatepass"), digest_size=16)
+        for k in sorted(snap.formats):
+            h.update(k.encode())
+            h.update(snap.formats[k])
+        sig = h.digest()  # 길이가 아니라 실제 내용으로 비교(같은 크기의 다른 이미지를 놓치지 않게)
+        now = time.time()
+        if sig == self._last_sig and now - self._last_sig_at < DUP_WINDOW:
+            return
+        self._last_sig, self._last_sig_at = sig, now
+
+        identity = None
+        if snap.kind == "image":
+            identity = snap.formats.get("CF_DIB") or snap.formats.get("PNG")
+        elif snap.kind == "files":
+            identity = snap.text.encode("utf-8", "surrogatepass")  # 같은 경로 '텍스트'와 구분
+        entry, new = self.store.add(snap.text, snap.source, kind=snap.kind, formats=snap.formats or None,
+                                    thumb=snap.thumb, meta=snap.meta, identity=identity)
+        old = self.index.get(entry.id)
+        if old and not new:
+            entry.pinned, entry.source = old.pinned, entry.source or old.source
+            entry.meta = entry.meta or old.meta
+        self.index.put(entry)
+        log.info("저장: id=%d %s %d자 %s", entry.id, entry.kind, entry.chars, "신규" if new else "재사용")
+        self._changed()
+
+    def on_menu(self, cmd: int) -> None:
+        if cmd == win32.MENU_OPEN:
+            self.window.show(None)
+        elif cmd == win32.MENU_PAUSE:
+            self.set_paused(not self.paused)
+        elif cmd == win32.MENU_FOLDER:
+            os.startfile(str(self.folder))
+        elif cmd == win32.MENU_QUIT:
+            self.host.stop()
+
+    def set_paused(self, paused: bool, auto_resume_s: int = 0) -> None:
+        self.paused = paused
+        self.host.set_paused(paused)
+        job = getattr(self, "_resume_job", None)
+        if job:
+            self.root.after_cancel(job)
+            self._resume_job = None
+        if paused and auto_resume_s > 0:
+            # 외부(테스트 등)가 멈춰 놓고 재개를 못 하고 죽어도 기록이 영영 멈추지 않게
+            self._resume_job = self.root.after(auto_resume_s * 1000, lambda: self.set_paused(False))
+        log.info("기록 %s%s", "일시정지" if paused else "재개",
+                 f" ({auto_resume_s}초 뒤 자동 재개)" if paused and auto_resume_s else "")
+
+    def _changed(self) -> None:
+        self._push_recent()
+        self.window.data_changed()
+
+    def _push_recent(self) -> None:
+        self.host.set_recent([(e.id, menu_label(e)) for e in self.index.recent(self.cfg.recent_menu_count)])
+
+    # ---- 검색 창 동작
+    def copy_entry(self, e: Entry, paste: bool, prev_hwnd) -> None:
+        try:
+            formats = self.store.formats_for(e)
+            if not formats:
+                raise OSError("저장된 원본이 없습니다.")
+            win32.set_clipboard_formats(formats, self.host.hwnd)
+        except Exception as exc:
+            if self.window.visible():
+                self.window.flash(f"복사하지 못했습니다: {exc}")
+            else:  # 트레이 '최근 항목'에서 실패하면 창이 없으니 알림으로
+                self.host.balloon("클립보드 기록", f"복사하지 못했습니다: {exc}")
+            log.warning("복사 실패: id=%d %s", e.id, exc)
+            return
+        log.info("다시 복사: id=%d%s", e.id, " (붙여넣기)" if paste else "")
+        self.window.hide()
+        if paste and prev_hwnd and win32.IsWindow(prev_hwnd):
+            self.root.after(80, lambda: self._paste_into(prev_hwnd, 0))
+
+    def _paste_into(self, hwnd, tries: int) -> None:
+        # Shift(Shift+Enter)를 아직 누르고 있으면 Ctrl+Shift+V 가 되므로 뗄 때까지 잠깐 기다린다.
+        if tries < 20 and win32.key_down(win32.VK_SHIFT):
+            self.root.after(50, lambda: self._paste_into(hwnd, tries + 1))
+            return
+        if tries >= 20:
+            log.info("Shift 가 계속 눌려 있어 붙여넣기를 취소했습니다(복사는 됨)")
+            return
+        if not win32.force_foreground(hwnd):
+            log.info("붙여넣기 대상 창으로 전환하지 못해 복사만 했습니다")
+            return
+
+        def paste():
+            # 그 사이 사용자가 다른 창으로 옮겼거나 수정 키를 누르고 있으면 엉뚱한 곳에 붙지 않게 취소
+            if win32.GetForegroundWindow() != hwnd or any(win32.key_down(k) for k in (
+                    win32.VK_SHIFT, win32.VK_CONTROL, win32.VK_MENU, win32.VK_LWIN, win32.VK_RWIN)):
+                log.info("붙여넣기 대상이 바뀌어 취소했습니다(복사는 됨)")
+                return
+            win32.send_ctrl_v()
+
+        self.root.after(60, paste)
+
+    def delete_entry(self, e: Entry) -> None:
+        self.store.delete(e.id)
+        self.index.remove(e.id)
+        log.info("삭제: id=%d", e.id)
+        self._push_recent()
+
+    def toggle_pin(self, e: Entry) -> None:
+        e.pinned = not e.pinned
+        self.store.set_pinned(e.id, e.pinned)
+        self.index.put(e)
+        log.info("고정 %s: id=%d", "설정" if e.pinned else "해제", e.id)
+
+
+def run(folder: Path, cfg: Config, warnings: list[str] | None = None) -> int:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        pass
+    mutex = win32.single_instance(f"Local\\ClipboardHistory-{instance_tag(folder)}")
+    if mutex is None:
+        log.info("이미 실행 중이라 종료")
+        return 0
+    App(folder, cfg, warnings).run()
+    return 0

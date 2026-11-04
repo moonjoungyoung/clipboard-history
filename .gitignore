@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.omc/
+*.log
+/tmp/
+# 실수로 기록 DB·키를 올리지 않게
+*.db
+*.db-wal
+*.db-shm
+*.broken-*
+key.bin
+.venv/
+.claude/
