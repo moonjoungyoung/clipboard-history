@@ -336,12 +336,24 @@ class SearchWindow:
             self.root.attributes("-topmost", False)
 
     def _position(self, caret) -> tuple[int, int]:
-        """입력 커서 근처(아래, 모자라면 위). 커서를 모르면 마우스가 있는 화면의 위쪽 가운데."""
+        """입력 커서 근처(아래, 모자라면 위). 커서를 모르면 쓰던 창의 가운데, 그것도 모르면 화면 위쪽 가운데."""
         if caret and self.position_mode == "caret":
             area = win32.work_area_at((caret[0] + caret[2]) // 2, caret[3] - 1)
             if area:
                 return theme.place_near_caret(caret, area, (self.W, self.H), gap=self.px(8),
                                               margin=self.px(8), inset=self.px(Size.PAD + 46))
+        if self.position_mode == "caret" and self.prev_hwnd:
+            box = win32.window_rect(self.prev_hwnd)
+            if box:
+                l, t, r, b = box
+                area = win32.work_area_at((l + r) // 2, (t + b) // 2)
+                if area:
+                    # 넓은 모니터에서 화면 가운데는 쓰던 창과 멀 수 있어, 쓰던 창의 가운데(위쪽)에 둔다
+                    x = (l + r - self.W) // 2
+                    y = t + max(self.px(24), (b - t - self.H) // 3)
+                    m = self.px(8)
+                    return (max(area[0] + m, min(x, area[2] - m - self.W)),
+                            max(area[1] + m, min(y, area[3] - m - self.H)))
         area = win32.work_area_at_cursor()
         if area:
             l, t, r, b = area

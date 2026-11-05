@@ -72,11 +72,24 @@ def _rects(rng) -> list[tuple[float, float, float, float]]:
         oleaut32.SafeArrayDestroy(sa)
 
 
+def _is_degenerate(rng) -> bool:
+    """범위의 시작과 끝이 같은지(=선택 없이 커서만 있음). CompareEndpoints(vtable 5)"""
+    comp = ctypes.c_int(1)
+    hr = _vt(rng, 5, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int))(
+        rng, TextPatternRangeEndpoint_Start, rng, TextPatternRangeEndpoint_End, ctypes.byref(comp))
+    return hr == 0 and comp.value == 0
+
+
 def _caret_from_range(rng) -> tuple[int, int, int, int] | None:
     rects = _rects(rng)
-    if rects:  # 선택 영역이 있으면 그 끝
+    degenerate = _is_degenerate(rng)
+    if rects and not degenerate:  # 선택 영역이 있으면 그 끝
         x, y, w, h = rects[-1]
         return int(x + w), int(y), int(x + w) + 1, int(y + h)
+    if rects:
+        # 커서만 있는데 사각형이 왔다: Chrome 은 빈 입력칸에서 '줄 전체' 사각형을 준다. 커서는 그 시작(왼쪽)이다.
+        x, y, w, h = rects[0]
+        return int(x), int(y), int(x) + 1, int(y + h)
     # 빈 범위(커서만 있음)는 사각형이 없다 → 커서 다음 글자(없으면 앞 글자)로 넓혀서 위치를 잡는다
     for endpoint, delta, use_right in ((TextPatternRangeEndpoint_End, 1, False),
                                        (TextPatternRangeEndpoint_Start, -1, True)):
@@ -98,44 +111,70 @@ def _caret_from_range(rng) -> tuple[int, int, int, int] | None:
     return None
 
 
-def caret_rect_uia() -> tuple[int, int, int, int] | None:
-    """포커스된 요소의 텍스트 커서 화면 좌표. 못 찾으면 None. (CoInitializeEx 된 스레드에서 호출)"""
+# 입력칸으로 볼 컨트롤 종류. Document(50030, 웹 페이지 본문)는 '선택된 글자' 위치라 커서로 쓰지 않는다.
+EDITABLE_TYPES = {50004, 50003}  # Edit, ComboBox
+
+
+def focused_info():
+    """(커서 사각형 또는 None, 포커스된 입력칸 경계 또는 None). 입력칸이 아니면 둘 다 None."""
     uia = ctypes.c_void_p()
     if ole32.CoCreateInstance(ctypes.byref(CLSID_CUIAutomation), None, 1, ctypes.byref(IID_IUIAutomation),
                               ctypes.byref(uia)) != 0:
-        return None
-    el = pat = rng = None
+        return None, None
+    el = None
     try:
         el = ctypes.c_void_p()
-        if _vt(uia, 8, ctypes.POINTER(ctypes.c_void_p))(uia, ctypes.byref(el)) != 0 or not el.value:  # GetFocusedElement
-            return None
-        pat = ctypes.c_void_p()
-        get_as = _vt(el, 14, ctypes.c_int, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))  # GetCurrentPatternAs
-        if get_as(el, UIA_TextPattern2Id, ctypes.byref(IID_TextPattern2), ctypes.byref(pat)) == 0 and pat.value:
-            active, rng = wt.BOOL(), ctypes.c_void_p()
-            # IUIAutomationTextPattern2::GetCaretRange (vtable 10)
-            if _vt(pat, 10, ctypes.POINTER(wt.BOOL), ctypes.POINTER(ctypes.c_void_p))(
-                    pat, ctypes.byref(active), ctypes.byref(rng)) == 0 and rng.value:
-                return _caret_from_range(rng)
-            return None
-        # TextPattern 만 있으면 선택 영역(GetSelection, vtable 5)의 첫 범위로
-        pat = ctypes.c_void_p()
-        if get_as(el, UIA_TextPatternId, ctypes.byref(IID_TextPattern), ctypes.byref(pat)) != 0 or not pat.value:
-            return None
-        arr = ctypes.c_void_p()
-        if _vt(pat, 5, ctypes.POINTER(ctypes.c_void_p))(pat, ctypes.byref(arr)) != 0 or not arr.value:
-            return None
-        try:
-            length = ctypes.c_int()
-            _vt(arr, 3, ctypes.POINTER(ctypes.c_int))(arr, ctypes.byref(length))  # get_Length
-            if length.value < 1:
-                return None
-            rng = ctypes.c_void_p()
-            if _vt(arr, 4, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(arr, 0, ctypes.byref(rng)) != 0:  # GetElement
-                return None
-            return _caret_from_range(rng)
-        finally:
-            _release(arr)
+        if _vt(uia, 8, ctypes.POINTER(ctypes.c_void_p))(uia, ctypes.byref(el)) != 0 or not el.value:
+            return None, None
+        ct = ctypes.c_int()
+        if _vt(el, 21, ctypes.POINTER(ctypes.c_int))(el, ctypes.byref(ct)) != 0 or ct.value not in EDITABLE_TYPES:
+            return None, None  # get_CurrentControlType: 입력칸이 아님
+        rc = wt.RECT()
+        bounds = None
+        if _vt(el, 43, ctypes.POINTER(wt.RECT))(el, ctypes.byref(rc)) == 0 and rc.bottom > rc.top:
+            bounds = (rc.left, rc.top, rc.right, rc.bottom)  # get_CurrentBoundingRectangle
+        return _caret_of(el), bounds
     finally:
-        for o in (rng, pat, el, uia):
+        for o in (el, uia):
             _release(o)
+
+
+def caret_rect_uia() -> tuple[int, int, int, int] | None:
+    """포커스된 입력칸의 텍스트 커서 화면 좌표. 못 찾으면 None. (CoInitializeEx 된 스레드에서 호출)"""
+    return focused_info()[0]
+
+
+def _caret_of(el) -> tuple[int, int, int, int] | None:
+    """입력칸 요소의 커서 위치: TextPattern2.GetCaretRange, 없으면 TextPattern.GetSelection 의 첫 범위."""
+    get_as = _vt(el, 14, ctypes.c_int, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))  # GetCurrentPatternAs
+    pat2 = ctypes.c_void_p()
+    if get_as(el, UIA_TextPattern2Id, ctypes.byref(IID_TextPattern2), ctypes.byref(pat2)) == 0 and pat2.value:
+        rng = ctypes.c_void_p()
+        try:
+            active = wt.BOOL()
+            # IUIAutomationTextPattern2::GetCaretRange (vtable 10)
+            if _vt(pat2, 10, ctypes.POINTER(wt.BOOL), ctypes.POINTER(ctypes.c_void_p))(
+                    pat2, ctypes.byref(active), ctypes.byref(rng)) == 0 and rng.value:
+                return _caret_from_range(rng)
+        finally:
+            _release(rng)
+            _release(pat2)
+    pat = ctypes.c_void_p()
+    if get_as(el, UIA_TextPatternId, ctypes.byref(IID_TextPattern), ctypes.byref(pat)) != 0 or not pat.value:
+        return None
+    arr = ctypes.c_void_p()
+    rng = ctypes.c_void_p()
+    try:
+        if _vt(pat, 5, ctypes.POINTER(ctypes.c_void_p))(pat, ctypes.byref(arr)) != 0 or not arr.value:  # GetSelection
+            return None
+        length = ctypes.c_int()
+        _vt(arr, 3, ctypes.POINTER(ctypes.c_int))(arr, ctypes.byref(length))  # get_Length
+        if length.value < 1:
+            return None
+        if _vt(arr, 4, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(arr, 0, ctypes.byref(rng)) != 0:  # GetElement
+            return None
+        return _caret_from_range(rng)
+    finally:
+        _release(rng)
+        _release(arr)
+        _release(pat)

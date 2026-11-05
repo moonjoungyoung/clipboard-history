@@ -983,13 +983,16 @@ class _CaretWorker:
             rect = None
             try:
                 rect, focus = _caret_from_thread(fg)          # 1) 시스템 캐럿(메모장 등): 즉시
+                field = None
                 if rect is None and com_ok:
-                    rect = uia.caret_rect_uia()                # 2) UI Automation(Chrome·Edge·VS Code 등)
+                    rect, field = uia.focused_info()           # 2) UI Automation(Chrome·Edge·VS Code 등)
                 if rect is None and com_ok:
                     for target in dict.fromkeys(h for h in (focus, fg) if h):
                         rect = _caret_from_msaa(target)        # 3) 접근성(MSAA)
                         if rect:
                             break
+                if rect is None and field:
+                    rect = field  # 3') 커서는 못 찾았지만 입력칸 위치는 앎: 입력칸 위나 아래에
                 if rect and not _on_some_monitor(rect):
                     rect = None
             except Exception:  # noqa: BLE001  대상 앱이 이상한 값을 줘도 창은 열려야 한다
@@ -1022,6 +1025,16 @@ def caret_rect(fg, timeout: float = 0.25) -> tuple[int, int, int, int] | None:
     if _caret_worker.busy:
         return None  # 앞 조회가 아직 안 끝남(대상 앱이 멈춤): 기다리지 않고 가운데에 띄운다
     return _caret_worker.query(fg, timeout)
+
+
+GetWindowRect = _proto(user32, "GetWindowRect", wt.BOOL, wt.HWND, ctypes.POINTER(wt.RECT))
+
+
+def window_rect(hwnd) -> tuple[int, int, int, int] | None:
+    r = wt.RECT()
+    if not hwnd or not GetWindowRect(hwnd, ctypes.byref(r)) or r.right - r.left < 50:
+        return None
+    return r.left, r.top, r.right, r.bottom
 
 
 def work_area_at(x: int, y: int) -> tuple[int, int, int, int] | None:
