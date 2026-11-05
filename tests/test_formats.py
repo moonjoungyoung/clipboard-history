@@ -181,6 +181,7 @@ class PollResilienceTest(unittest.TestCase):
 
         stub._handle = handle
         stub._poll = lambda: None
+        stub._drain = lambda: App._drain(stub)
         for k in ("boom", "clip", "quit"):
             stub.events.put((k, None))
         App._poll(stub)
@@ -191,3 +192,28 @@ class PollResilienceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoDowngradeTest(unittest.TestCase):
+    def test_richer_payload_is_kept_and_follow_up_not_counted(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Store(Path(d))
+            rich = {"Biff12": b"b" * 50, "HTML Format": b"<td>x</td>", "CF_UNICODETEXT": "x".encode("utf-16-le")}
+            e, _ = s.add("x", "EXCEL.EXE", formats=rich)
+            # 엑셀이 닫히며 텍스트·RTF 만 다시 올림 → 풍부한 묶음 유지, 횟수 그대로
+            e2, new = s.add("x", "EXCEL.EXE", formats={"CF_UNICODETEXT": rich["CF_UNICODETEXT"]}, bump=False,
+                            follow_up=True)
+            self.assertFalse(new)
+            self.assertEqual(s.payload(e.id), rich)
+            self.assertEqual(s.get(e.id).copy_count, 1)
+            self.assertEqual(e2.copy_count, 1)
+            # 독립된 새 복사면 형식이 더 적어도 새 것으로 바꾼다(다른 앱에서 같은 글자를 새 서식으로 복사)
+            plain = {"CF_UNICODETEXT": rich["CF_UNICODETEXT"], "HTML Format": b"<i>x</i>"}
+            s.add("x", "chrome.exe", formats=plain)
+            self.assertEqual(s.payload(e.id), plain)
+            # 다른 형식이 섞인 새 묶음이면 교체한다
+            other = {"CF_UNICODETEXT": rich["CF_UNICODETEXT"], "Rich Text Format": b"{\rtf1 x}"}
+            s.add("x", None, formats=other)
+            self.assertEqual(s.payload(e.id), other)
+            self.assertEqual(s.get(e.id).copy_count, 3)
+            s.close()

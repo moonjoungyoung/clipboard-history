@@ -103,10 +103,12 @@ class SearchWindowTest(unittest.TestCase):
         win32.force_foreground = lambda h: True
         try:
             self.w.show(12345)
-            self.w.show(self.w._own_hwnd())
+            self.w.show(None, None, True)          # 떠 있을 때 단축키를 다시 누름
             self.assertEqual(self.w.prev_hwnd, 12345)
             self.w._copy(True)
             self.assertEqual(self.copied[-1][2], 12345)
+            self.w.show(None, None, False)         # 트레이로 다시 열면 붙여넣을 대상 없음
+            self.assertIsNone(self.w.prev_hwnd)
         finally:
             win32.force_foreground = orig
             self.w.hide()

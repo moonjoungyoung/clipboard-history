@@ -21,9 +21,9 @@ A Windows clipboard history that doesn't forget after 25 items.
 
 ## 뭘 해 주냐면
 
-- **복사한 건 다 기록합니다.** 텍스트, 서식(HTML/RTF), 이미지, 탐색기에서 복사한 파일까지 Win+V가 다루는 것은 다 남깁니다. 개수 제한은 없고, 마지막으로 쓴 지 **90일**이 지나면 알아서 정리합니다(고정한 건 빼고).
-- **Win+Alt+V로 바로 검색합니다.** 글자를 치면 바로 걸러지고 Enter 한 번이면 다시 클립보드에 들어갑니다. 검색어는 형광펜처럼 칠해지고, 결과는 오늘 / 어제 / 지난 7일처럼 시간대별로 묶여서 "그때 그거"를 찾기 쉽습니다.
-- **원본 그대로 돌려줍니다.** 서식 있는 글은 서식째, 이미지는 이미지로, 파일은 다시 붙여넣을 수 있는 파일로 돌려줍니다.
+- **복사한 건 다 기록합니다.** 텍스트, 서식(HTML/RTF), 엑셀 셀, 이미지, 탐색기에서 복사한 파일까지 남깁니다. 개수 제한은 없고, 마지막으로 쓴 지 **90일**이 지나면 알아서 정리합니다(고정한 건 빼고).
+- **쓰던 자리에서 바로 꺼냅니다.** 단축키를 누르면 지금 글을 쓰던 커서 바로 아래에 창이 뜹니다(아래가 모자라면 위로). 글자를 치면 바로 걸러지고, **Enter 한 번이면 그 자리에 붙여넣어집니다.** 검색어는 형광펜처럼 칠해지고, 결과는 오늘 / 어제 / 지난 7일처럼 시간대별로 묶여서 "그때 그거"를 찾기 쉽습니다.
+- **원본 그대로 돌려줍니다.** 서식 있는 글은 서식째, 엑셀 셀은 엑셀 형식(숫자 서식·채우기 색·굵기)째, 이미지는 이미지로, 파일은 다시 붙여넣을 수 있는 파일로 돌려줍니다.
 - **내 PC 밖으로 안 나갑니다.** 네트워크 기능이 아예 없습니다. 저장할 때는 Windows 계정 키(DPAPI)로 암호화해서, DB 파일만 빼 가서는 읽을 수 없습니다.
 - **비밀번호는 피해 갑니다.** 비밀번호 관리자가 "기록하지 마" 표시를 붙여 복사한 것과, 제외 목록에 넣은 앱이 복사한 것은 아예 읽지도 않습니다. 다만 브라우저 확장형 관리자처럼 표시를 안 붙이는 경우는 기록될 수 있으니, 필요하면 잠깐 일시정지하세요.
 - **설치할 게 없습니다.** Python 표준 라이브러리만 씁니다(pip install 없음).
@@ -57,9 +57,9 @@ Windows 탐색기가 Win+V를 쥐고 있어서, 탐색기 설정(`DisabledHotkey
 
 | 하고 싶은 것 | 이렇게 |
 |---|---|
-| 검색 창 열기 | **Win+Alt+V**(위 설정을 했다면 Win+V), 또는 트레이 아이콘 클릭 |
-| 다시 복사 | **Enter** 또는 더블클릭 |
-| 복사하고 바로 붙여넣기 | **Shift+Enter**(단축키로 창을 열었을 때, 원래 쓰던 창에 붙여넣음) |
+| 검색 창 열기 | **Win+Alt+V**(위 설정을 했다면 Win+V), 또는 트레이 아이콘 클릭. 단축키로 열면 입력 커서 근처에 뜹니다 |
+| 바로 붙여넣기 | **Enter** 또는 더블클릭(창을 열기 전에 쓰던 곳에 붙여넣음. 트레이로 열었으면 복사만) |
+| 클립보드에 복사만 | **Shift+Enter** |
 | 고정 / 해제 | **Ctrl+P**(고정한 건 90일이 지나도 안 지워짐) |
 | 삭제 | **Ctrl+D** 또는 오른쪽 클릭 |
 | 닫기 | **Esc**(검색어가 있으면 먼저 지움), 또는 다른 곳 클릭 |
@@ -73,6 +73,7 @@ Windows 탐색기가 Win+V를 쥐고 있어서, 탐색기 설정(`DisabledHotkey
 {
   "retention_days": 90,
   "hotkey": "win+alt+v",
+  "popup_position": "caret",
   "max_chars": 1000000,
   "max_bytes": 67108864,
   "recent_menu_count": 15,
@@ -81,9 +82,10 @@ Windows 탐색기가 Win+V를 쥐고 있어서, 탐색기 설정(`DisabledHotkey
 }
 ```
 
+- `popup_position`: `"caret"`이면 입력 커서 근처, `"center"`면 화면 위쪽 가운데에 뜹니다. 커서 위치를 알려 주지 않는 앱에서는 `"caret"`이어도 가운데에 뜹니다.
 - `exclude_processes`: 이 프로그램들이 복사한 건 저장하지 않습니다.
 - `exclude_patterns`: 정규식에 맞는 텍스트는 저장하지 않습니다(앞뒤 공백·줄바꿈을 뗀 상태로도 한 번 더 검사). 토큰을 거르고 싶다면 `"^sk-[A-Za-z0-9_-]{20,}$"`, `"^gh[pousr]_[A-Za-z0-9]{20,}$"`, `"^AKIA[0-9A-Z]{16}$"` 같은 걸 넣으세요.
-- `max_bytes`: 이미지나 서식 하나가 이보다 크면 건너뜁니다(기본 64MB).
+- `max_bytes`: 한 번 복사한 것의 서식·이미지 합계 상한입니다(기본 64MB). 넘는 서식은 빼고 텍스트만 남깁니다.
 - 값의 형식이 틀리면 그 항목만 기본값으로 돌아가고 트레이 알림으로 알려 줍니다. 파일 자체가 JSON으로 안 읽히면 전체가 기본값이 됩니다.
 
 ## 데이터는 어디에
@@ -118,10 +120,13 @@ python -m clipboard_history open|quit      # 창 열기 / 종료
 ```powershell
 python -m unittest discover -s tests   # 단위 테스트(창은 안 띄움)
 .\scripts\run-e2e.ps1                  # 실제 데스크톱 세션에서 하는 e2e(더미 데이터)
+.\scripts\run-e2e.ps1 -Script e2e_office_caret.py   # 입력 커서 찾기 + 숨긴 Excel·Word 로 서식 왕복
 .\scripts\run-render.ps1               # 검색 창 스크린샷(더미 데이터)
 ```
 
-e2e는 임시 폴더를 따로 쓰고, 도는 동안 실제로 실행 중인 인스턴스는 일시정지시킵니다(테스트가 중간에 죽어도 10분 뒤 자동 재개). 끝나면 원래 클립보드의 텍스트·서식·이미지·파일 목록을 되돌려 놓습니다. 비밀번호처럼 백업하면 안 되는 내용이 클립보드에 있으면 시작하지 않습니다.
+e2e는 임시 폴더를 따로 쓰고, 도는 동안 실제로 실행 중인 인스턴스는 일시정지시킵니다(테스트가 중간에 죽어도 10분 뒤 자동 재개). 테스트 중에 직접 복사하면 테스트가 멈추고, 그 복사는 실제 기록으로 옮겨집니다(실제 설정의 제외 앱·패턴은 그대로 적용). 끝나면 원래 클립보드를 되돌려 놓습니다. 지금 클립보드를 그대로 되돌릴 수 없는 경우(비밀번호처럼 기록 제외 표식이 있거나, 앱 고유 형식이 섞여 있음)에는 시작하지 않습니다.
+
+> e2e는 실제 데스크톱 클립보드를 씁니다. Office 테스트처럼 다른 앱이 클립보드를 쓰는 구간은 사용자 복사와 겹치는 것을 완전히 막을 수 없으니, **PC를 쓰지 않을 때** 돌리세요.
 
 ```
 clipboard_history/
@@ -138,7 +143,9 @@ clipboard_history/
 - 검색할 때는 전체 기록을 복호화해서 메모리에 올려 둡니다. 텍스트 몇만 개 정도는 문제없습니다.
 - 강제로 종료하면 트레이 아이콘이 잠깐 남을 수 있습니다(마우스를 올리면 사라짐).
 - 미리보기는 앞 2만 자까지만 보여 줍니다. 다시 복사하면 전체가 들어갑니다.
-- 관리자 권한으로 실행 중인 창에는 Shift+Enter 붙여넣기가 막힐 수 있습니다(Windows 보안 제한).
+- 관리자 권한으로 실행 중인 창에는 Enter 붙여넣기가 막힐 수 있습니다(Windows 보안 제한). 그때는 클립보드에 복사만 되니 Ctrl+V 하세요.
+- 엑셀 **수식**은 값으로 붙습니다. 엑셀은 같은 창 안에서 복사·붙여넣기할 때만 수식을 그대로 옮기고, 다른 곳(Win+V 포함)에서 온 것은 값으로 바꾸면서 안내 창을 한 번 띄웁니다("다시 표시 안 함"으로 끌 수 있음). 숫자 서식·채우기 색·굵기는 그대로 옵니다.
+- 로그온 자동 실행은 작업 스케줄러(`ClipboardHistoryAtLogon`)로 합니다. 그래서 작업 관리자의 "시작 프로그램" 목록에는 안 보입니다.
 
 ---
 
@@ -154,9 +161,9 @@ So I built this: a tiny tray app that keeps everything you copy and lets you sea
 
 ### What it does
 
-- **Keeps everything you copy.** Text, rich text (HTML/RTF), images, and files copied in Explorer, the same things Win+V handles. No item limit. Entries are cleaned up **90 days** after you last used them (pinned ones stay).
-- **Win+Alt+V to search.** Results filter as you type and Enter puts the item back on the clipboard. Matches get a highlighter mark, and results are grouped by Today / Yesterday / Last 7 days so "that thing from Tuesday" is easy to find.
-- **Gives it back exactly.** Formatting stays formatting, images stay images, files paste as files.
+- **Keeps everything you copy.** Text, rich text (HTML/RTF), Excel cells, images, and files copied in Explorer. No item limit. Entries are cleaned up **90 days** after you last used them (pinned ones stay).
+- **Right where you're typing.** The hotkey opens the window just below your text cursor (above it if there's no room). Type to filter, and **Enter pastes it right there**. Matches get a highlighter mark, and results are grouped by Today / Yesterday / Last 7 days so "that thing from Tuesday" is easy to find.
+- **Gives it back exactly.** Formatting stays formatting, Excel cells keep number formats, fills and bold, images stay images, files paste as files. (Excel formulas paste as values; Excel only keeps formulas within the same Excel window.)
 - **Stays on your PC.** There is no network code at all. Everything is encrypted with your Windows account key (DPAPI), so the database file alone is unreadable.
 - **Steers clear of passwords.** Copies that password managers mark as "don't record", and copies from apps on your exclude list, are never read. Browser-extension managers that don't set the marker can still get recorded, so pause recording from the tray when you need to.
 - **Nothing to install.** Python standard library only, no pip.
@@ -180,8 +187,8 @@ It starts at logon and lives in the tray.
 | | |
 |---|---|
 | Open | **Win+Alt+V** (or Win+V after `use-win-v.ps1`), or click the tray icon |
-| Copy back | **Enter** or double-click |
-| Copy and paste into the previous window | **Shift+Enter** |
+| Paste where you were typing | **Enter** or double-click (copy only if you opened it from the tray) |
+| Copy to clipboard only | **Shift+Enter** |
 | Pin / unpin | **Ctrl+P** |
 | Delete | **Ctrl+D** or right-click |
 | Close | **Esc** or click elsewhere |

@@ -1,6 +1,6 @@
 ﻿# 사용자 데스크톱 세션에서 e2e 를 돌리고 결과를 출력한다.
 # (SSH·서비스 같은 세션 0 셸은 사용자 클립보드에 접근할 수 없어서 일회용 예약 작업으로 실행)
-param([int]$TimeoutSec = 180)
+param([int]$TimeoutSec = 240, [string]$Script = 'e2e_session.py', [switch]$DiscardClipboard)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $outDir = Join-Path $root 'tmp'
@@ -10,7 +10,7 @@ if (Test-Path $result) { Remove-Item $result }
 
 $pyw = (Get-Command pythonw.exe).Source
 $taskName = 'ClipboardHistoryE2E'
-$action = New-ScheduledTaskAction -Execute $pyw -Argument "`"$root\tests\e2e_session.py`" `"$result`" `"$outDir`"" -WorkingDirectory $root
+$action = New-ScheduledTaskAction -Execute $pyw -Argument "`"$root\tests\$Script`" `"$result`" `"$outDir`"$(if ($DiscardClipboard) { ' --discard-clipboard' })" -WorkingDirectory $root
 $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null

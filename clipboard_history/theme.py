@@ -93,6 +93,31 @@ def pick_font(available: set[str], chain: tuple[str, ...]) -> str:
     return "TkDefaultFont"
 
 
+def place_near_caret(caret: tuple[int, int, int, int], area: tuple[int, int, int, int],
+                     size: tuple[int, int], gap: int = 8, margin: int = 8, inset: int = 24) -> tuple[int, int]:
+    """입력 커서 바로 아래에 창을 둔다. 아래가 모자라면 위로 뒤집고, 좌우는 화면 안으로 민다.
+
+    caret/area: (left, top, right, bottom) 화면 좌표, size: (폭, 높이). 반환: 창 왼쪽 위 (x, y).
+    inset: 창 왼쪽 끝이 아니라 검색칸 글자 시작쯤이 커서 아래에 오도록 왼쪽으로 당기는 양.
+    """
+    cl, ct, cr, cb = caret
+    l, t, r, b = area
+    w, h = size
+    below = cb + gap
+    above = ct - gap - h
+    if below + h <= b - margin:
+        y = below
+    elif above >= t + margin:
+        y = above
+    else:
+        # 위아래 어느 쪽도 다 들어가지 않으면 더 넓은 쪽에 두고 화면 안으로 자른다
+        y = below if (b - cb) >= (ct - t) else above
+        y = max(t + margin, min(y, b - margin - h))
+    x = cl - inset
+    x = max(l + margin, min(x, r - margin - w))
+    return x, y
+
+
 # 크기(논리 px, 4px 기준 격자). 실제 픽셀은 DPI 배율을 곱한다.
 class Size:
     W, H = 760, 484

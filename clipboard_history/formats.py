@@ -6,7 +6,9 @@ import zlib
 
 # 이름으로 저장한다. 표준 형식은 아래 이름을, 등록 형식은 등록 이름을 그대로 쓴다.
 CF_STANDARD = {"CF_UNICODETEXT": 13, "CF_DIB": 8, "CF_DIBV5": 17, "CF_HDROP": 15}
-TEXT_EXTRAS = ("HTML Format", "Rich Text Format")   # 텍스트와 함께 보관하는 서식
+# 텍스트와 함께 보관하는 형식. 엑셀 고유 형식(Biff12 등)이 있어야 엑셀에 다시 붙일 때 숫자 서식·채우기 색 같은 셀 서식이 살아난다(수식은 엑셀 제한으로 값이 됨).
+TEXT_EXTRAS = ("Biff12", "Biff8", "Biff5", "XML Spreadsheet", "HTML Format", "Rich Text Format", "Csv")
+TEXT_IMAGE_MAX_CHARS = 2000  # 텍스트와 이미지가 함께 올 때(엑셀 셀 그림 등) 이 길이 이하일 때만 그림도 보관
 IMAGE_EXTRAS = ("PNG",)                             # 투명도를 지키려고 같이 보관
 
 THUMB_MAX = 640

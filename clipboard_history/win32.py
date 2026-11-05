@@ -5,12 +5,13 @@ import ctypes
 import ctypes.wintypes as wt
 import logging
 import os
+import queue
 import threading
 import time
 from typing import Callable
 
 from .filters import Snapshot
-from .formats import (CF_STANDARD, TEXT_EXTRAS, build_hdrop, dib_info,
+from .formats import (CF_STANDARD, TEXT_EXTRAS, TEXT_IMAGE_MAX_CHARS, build_hdrop, dib_info,
                       dib_thumbnail_png, parse_hdrop)
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ WM_APP_TRAY = WM_APP + 1
 WM_APP_OPEN = WM_APP + 2   # 외부(CLI)에서 검색 창 열기 요청
 WM_APP_PAUSE = WM_APP + 3  # 외부에서 기록 일시정지(wParam=1)/재개(0)
 WM_APP_IS_PAUSED = WM_APP + 4  # 지금 일시정지 상태인지(반환값 1/0)
+WM_APP_RELOAD = WM_APP + 5     # 다른 프로세스가 DB 에 항목을 넣었으니 다시 불러오기
 
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 VK_SHIFT, VK_CONTROL, VK_MENU, VK_RETURN, VK_LWIN, VK_RWIN = 0x10, 0x11, 0x12, 0x0D, 0x5B, 0x5C
@@ -125,6 +127,9 @@ SetClipboardData = _proto(user32, "SetClipboardData", wt.HANDLE, wt.UINT, wt.HAN
 IsClipboardFormatAvailable = _proto(user32, "IsClipboardFormatAvailable", wt.BOOL, wt.UINT)
 RegisterClipboardFormatW = _proto(user32, "RegisterClipboardFormatW", wt.UINT, wt.LPCWSTR)
 GetClipboardOwner = _proto(user32, "GetClipboardOwner", wt.HWND)
+GetClipboardSequenceNumber = _proto(user32, "GetClipboardSequenceNumber", wt.DWORD)
+EnumClipboardFormats = _proto(user32, "EnumClipboardFormats", wt.UINT, wt.UINT)
+GetClipboardFormatNameW = _proto(user32, "GetClipboardFormatNameW", ctypes.c_int, wt.UINT, wt.LPWSTR, ctypes.c_int)
 CountClipboardFormats = _proto(user32, "CountClipboardFormats", ctypes.c_int)
 
 GlobalAlloc = _proto(kernel32, "GlobalAlloc", wt.HGLOBAL, wt.UINT, ctypes.c_size_t)
@@ -238,6 +243,24 @@ def _read_bytes(fmt: int, cap: int) -> bytes | None:
         GlobalUnlock(h)
 
 
+_CF_NAMES = {v: k for k, v in CF_STANDARD.items()}
+
+
+def _format_order() -> list[str]:
+    """열린 클립보드에 원래 앱이 넣은 형식 이름을 넣은 순서대로(붙여넣는 앱은 이 순서로 고른다)."""
+    names, fmt = [], 0
+    buf = ctypes.create_unicode_buffer(256)
+    for _ in range(512):
+        fmt = EnumClipboardFormats(fmt)
+        if not fmt:
+            break
+        if fmt in _CF_NAMES:
+            names.append(_CF_NAMES[fmt])
+        elif GetClipboardFormatNameW(fmt, buf, 256):
+            names.append(buf.value)
+    return names
+
+
 def _fmt_id(name: str) -> int:
     return CF_STANDARD.get(name) or RegisterClipboardFormatW(name)
 
@@ -247,7 +270,24 @@ TEXT_EXTRAS_MAX_CHARS = 500_000  # 이보다 긴 텍스트는 HTML/RTF 서식을
 
 def read_clipboard(hwnd=None, max_chars: int = 1_000_000, max_bytes: int = 64 * 1024 * 1024,
                    exclude_processes: frozenset[str] = frozenset()) -> Snapshot:
+    seq = GetClipboardSequenceNumber()  # 첫 읽기 '전'에 잰다(읽는 사이 새 복사가 오면 재시도로 덮지 않게)
     snap = _read_clipboard_raw(hwnd, max_chars, max_bytes, exclude_processes)
+    # 엑셀 등은 Copy 처리가 끝나기 전에 변경 알림이 와서 일부 형식(Biff12 등)을 아직 못 준다. 잠깐 뒤 다시 읽는다.
+    for _ in range(4):
+        if not snap.incomplete:
+            break
+        time.sleep(0.25)
+        if GetClipboardSequenceNumber() != seq:
+            break  # 그 사이 클립보드가 또 바뀜: 새 알림이 따로 온다
+        again = _read_clipboard_raw(hwnd, max_chars, max_bytes, exclude_processes)
+        if again.text is None:
+            break
+        if again.text == snap.text:
+            merged = dict(again.formats)
+            for k, v in snap.formats.items():  # 이전 시도에서만 받은 형식은 유지(순서는 뒤에 붙임)
+                merged.setdefault(k, v)
+            again.formats = merged
+        snap = again
     # 썸네일은 클립보드를 닫은 뒤에 만든다(그동안 다른 앱이 클립보드를 못 여는 시간을 줄임)
     if snap.kind == "image" and snap.text is not None and "CF_DIB" in snap.formats:
         snap.thumb = dib_thumbnail_png(snap.formats["CF_DIB"])
@@ -267,10 +307,12 @@ def _read_clipboard_raw(hwnd, max_chars: int, max_bytes: int, exclude_processes:
         source = None if (owner and hwnd and owner == hwnd) else process_name_of(owner)  # 다시 복사는 출처 유지
         if source and source.lower() in exclude_processes:
             return Snapshot(None, source, "excluded_process")  # 제외 앱이면 내용을 아예 읽지 않는다
-        if IsClipboardFormatAvailable(FMT_EXCLUDE):
-            return Snapshot(None, source, "excluded_format")
-        if IsClipboardFormatAvailable(FMT_VIEWER_IGNORE):
-            return Snapshot(None, source, "viewer_ignore")
+        # 표식이 목록에 있으면 기록하지 않는다. 단, 엑셀은 이 형식을 목록에만 올리고 데이터는 NULL 로 두므로
+        # (실측) 엑셀이 소유한 클립보드에서 데이터가 NULL 인 경우만 표식이 아닌 것으로 본다.
+        excel_owned = (source or "").lower() == "excel.exe"
+        for fmt, why in ((FMT_EXCLUDE, "excluded_format"), (FMT_VIEWER_IGNORE, "viewer_ignore")):
+            if IsClipboardFormatAvailable(fmt) and not (excel_owned and not GetClipboardData(fmt)):
+                return Snapshot(None, source, why)
         if IsClipboardFormatAvailable(FMT_CAN_INCLUDE_HISTORY) and _read_dword(FMT_CAN_INCLUDE_HISTORY) == 0:
             return Snapshot(None, source, "history_disallowed")
 
@@ -287,14 +329,32 @@ def _read_clipboard_raw(hwnd, max_chars: int, max_bytes: int, exclude_processes:
                 return Snapshot(None, source, "too_large")
             raw = raw[: len(raw) // 2 * 2]  # 홀수 길이로 할당한 앱 대비
             text = raw.decode("utf-16-le", "surrogatepass").split("\x00", 1)[0]
-            formats = {}
+            # 서식·엑셀 형식(과 짧은 텍스트면 함께 온 그림)을 원래 순서대로 보관한다.
+            wanted = set(TEXT_EXTRAS) | {"CF_UNICODETEXT"}
+            if len(text) <= TEXT_IMAGE_MAX_CHARS:
+                wanted |= {"CF_DIB", "PNG"}
+            formats: dict[str, bytes] = {}
+            missing = False
             budget = max_bytes if len(text) <= TEXT_EXTRAS_MAX_CHARS else 0
-            for name in TEXT_EXTRAS if budget else ():
-                data = _read_bytes(RegisterClipboardFormatW(name), budget)
-                if data:
-                    formats[name] = data
-                    budget -= len(data)
-            return Snapshot(text, source, None, kind="text", formats=formats)
+            if budget:
+                for name in _format_order():
+                    if name not in wanted or name in formats:
+                        continue
+                    if name == "CF_UNICODETEXT":
+                        formats[name] = text.encode("utf-16-le", "surrogatepass") + b"\x00\x00"
+                        continue
+                    if name in ("Biff8", "Biff5", "XML Spreadsheet") and "Biff12" in formats:
+                        continue  # 최신 엑셀 형식을 받았으면 큰 옛 형식은 렌더링시키지 않는다
+                    fid = _fmt_id(name)
+                    data = _read_bytes(fid, budget)
+                    if data:
+                        formats[name] = data
+                        budget -= len(data)
+                    elif name in ("Biff12", "HTML Format", "Rich Text Format") and not GetClipboardData(fid):
+                        missing = True  # 목록엔 있는데 원래 앱이 아직 데이터를 못 만들어 줌(엑셀 Copy 직후 등)
+            if set(formats) == {"CF_UNICODETEXT"}:
+                formats = {}  # 순수 텍스트는 따로 보관할 필요 없음
+            return Snapshot(text, source, None, kind="text", formats=formats, incomplete=missing)
 
         dib = _read_bytes(CF_DIB, max_bytes)
         png = _read_bytes(RegisterClipboardFormatW("PNG"), max_bytes - (len(dib) if dib else 0))
@@ -328,7 +388,11 @@ def _hglobal(data: bytes):
     return h
 
 
-def set_clipboard_formats(formats: dict[str, bytes], hwnd=None) -> None:
+class ClipboardChanged(OSError):
+    """expect_seq 와 다른 순번: 그 사이 누군가 클립보드를 바꿨다."""
+
+
+def set_clipboard_formats(formats: dict[str, bytes], hwnd=None, expect_seq: int | None = None) -> None:
     """이름→바이트 형식 묶음을 한 번에 클립보드에 넣는다.
 
     메모리를 모두 준비한 다음에 클립보드를 비우므로, 준비 단계에서 실패하면 기존 내용이 그대로 남는다.
@@ -351,6 +415,11 @@ def set_clipboard_formats(formats: dict[str, bytes], hwnd=None) -> None:
                 GlobalFree(h)
             raise OSError("클립보드를 열 수 없습니다(다른 프로그램이 사용 중).")
         try:
+            if expect_seq is not None and GetClipboardSequenceNumber() != expect_seq:
+                # 클립보드를 연(=다른 쓰기를 막은) 상태에서 확인하므로 확인과 쓰기 사이에 틈이 없다
+                for _fmt, h in handles:
+                    GlobalFree(h)
+                raise ClipboardChanged("클립보드가 그 사이 바뀌었습니다.")
             if not EmptyClipboard():
                 for _fmt, h in handles:
                     GlobalFree(h)
@@ -434,11 +503,63 @@ def force_foreground(hwnd) -> bool:
     return bool(SetForegroundWindow(hwnd))
 
 
+GetClassNameW = _proto(user32, "GetClassNameW", ctypes.c_int, wt.HWND, wt.LPWSTR, ctypes.c_int)
+
+
+_CONSOLE_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "PseudoConsoleWindow",
+                    "mintty", "VirtualConsoleClass"}
+_FOLDER_CLASSES = {"CabinetWClass", "ExploreWClass", "Progman", "WorkerW"}
+
+
+def risky_paste(hwnd, kind: str, text: str) -> str | None:
+    """바로 붙여넣으면 위험한 조합이면 이유(사용자에게 보여 줄 말), 아니면 None."""
+    buf = ctypes.create_unicode_buffer(64)
+    GetClassNameW(GetAncestor(hwnd, GA_ROOT) or hwnd, buf, 64)
+    cls = buf.value
+    if cls in _CONSOLE_CLASSES and kind == "text" and "\n" in text.strip():
+        return "여러 줄을 터미널에 넣으면 줄마다 실행될 수 있어"
+    if cls in _FOLDER_CLASSES and kind == "files":
+        return "파일을 폴더·바탕화면에 붙이면 실제로 복사되므로"
+    return None
+
+
+def is_shell_window(hwnd) -> bool:
+    """작업 표시줄·바탕화면처럼 창을 숨긴 직후 잠깐 앞에 올 수 있는 셸 창인지."""
+    buf = ctypes.create_unicode_buffer(64)
+    GetClassNameW(hwnd, buf, 64)
+    return buf.value in ("Shell_TrayWnd", "Progman", "WorkerW", "Shell_SecondaryTrayWnd")
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wt.LONG), ("dy", wt.LONG), ("mouseData", wt.DWORD), ("dwFlags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
+
+
+SendInput = _proto(user32, "SendInput", wt.UINT, wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+
+
 def send_ctrl_v() -> None:
-    keybd_event(VK_CONTROL, 0, 0, 0)
-    keybd_event(ord("V"), 0, 0, 0)
-    keybd_event(ord("V"), 0, KEYEVENTF_KEYUP, 0)
-    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    """Ctrl 누름·V 누름·V 뗌·Ctrl 뗌을 한 번에 넣는다(중간에 사용자 키 입력이 끼지 않음)."""
+    seq = [(VK_CONTROL, 0), (ord("V"), 0), (ord("V"), KEYEVENTF_KEYUP), (VK_CONTROL, KEYEVENTF_KEYUP)]
+    arr = (_INPUT * len(seq))()
+    for i, (vk, flags) in enumerate(seq):
+        arr[i].type = 1  # INPUT_KEYBOARD
+        arr[i].u.ki = _KEYBDINPUT(vk, 0, flags, 0, 0)
+    if SendInput(len(seq), arr, ctypes.sizeof(_INPUT)) != len(seq):
+        log.info("붙여넣기 키 입력이 막혔습니다(관리자 권한 창 등)")
 
 
 def key_down(vk: int) -> bool:
@@ -463,6 +584,8 @@ class NativeHost:
                  max_bytes: int = 64 * 1024 * 1024, exclude_processes=()):
         self.title = title
         self.exclude_processes = frozenset(p.lower() for p in exclude_processes)
+        self.locate_caret = True
+        self.popup_hwnd = lambda: None  # 검색 창 hwnd(메인 스레드가 채움)
         self.emit = emit
         self.hotkey = hotkey
         self.max_chars = max_chars
@@ -479,10 +602,30 @@ class NativeHost:
         self._wndproc = WNDPROC(self._proc)  # GC 방지
         self._taskbar_created = RegisterWindowMessageW("TaskbarCreated")
         self._thread = threading.Thread(target=self._run, name="native-host", daemon=True)
+        self._read_wanted = threading.Event()
+        self._reader = threading.Thread(target=self._read_loop, name="clip-reader", daemon=True)
 
     def start(self) -> None:
         self._thread.start()
         self.ready.wait(10)
+        self._reader.start()
+
+    def request_read(self) -> None:
+        self._read_wanted.set()
+
+    def _read_loop(self) -> None:
+        """변경 알림이 연달아 와도 마지막 상태를 한 번 읽는다(앞의 것을 읽는 중에 또 바뀌면 다시 읽음)."""
+        while True:
+            self._read_wanted.wait()
+            self._read_wanted.clear()
+            with self._lock:
+                paused = self._paused
+            if paused or not self.hwnd:
+                continue
+            try:
+                self.emit("clip", read_clipboard(self.hwnd, self.max_chars, self.max_bytes, self.exclude_processes))
+            except Exception:  # noqa: BLE001
+                log.exception("클립보드 읽기 실패")
 
     # 메인 스레드에서 호출
     def set_recent(self, items: list[tuple[int, str]]) -> None:
@@ -641,13 +784,24 @@ class NativeHost:
                 with self._lock:
                     paused = self._paused
                 if not paused:  # 일시정지 중에는 내용을 아예 읽지 않는다
-                    self.emit("clip", read_clipboard(hwnd, self.max_chars, self.max_bytes, self.exclude_processes))
+                    self._read_wanted.set()  # 실제 읽기는 읽기 스레드가(원래 앱이 늦게 렌더링해도 이 스레드는 안 막힘)
                 return 0
             if msg == WM_HOTKEY:
-                self.emit("open", GetForegroundWindow())
+                fg = GetForegroundWindow()
+                pid = wt.DWORD()
+                GetWindowThreadProcessId(fg, ctypes.byref(pid)) if fg else None
+                if not fg or pid.value == os.getpid():
+                    # 우리 창(검색 창·트레이 메뉴)이 앞이면 단축키를 다시 누른 것: 붙여넣을 대상은 그대로 둔다
+                    self.emit("open", (None, None, True))
+                else:
+                    caret = caret_rect(fg) if self.locate_caret else None
+                    self.emit("open", (fg, caret, False))
                 return 0
             if msg == WM_APP_OPEN:
-                self.emit("open", None)
+                self.emit("open", (None, None, False))
+                return 0
+            if msg == WM_APP_RELOAD:
+                self.emit("reload", None)
                 return 0
             if msg == WM_APP_IS_PAUSED:
                 with self._lock:
@@ -657,7 +811,7 @@ class NativeHost:
                 return 0
             if msg == WM_APP_TRAY:
                 if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                    self.emit("open", None)
+                    self.emit("open", (None, None, False))  # 트레이로 열면 붙여넣을 대상 없음(복사만)
                 elif lparam == WM_RBUTTONUP:
                     self._menu()
                 return 0
@@ -706,6 +860,178 @@ def style_popup(hwnd, border_hex: str, dark: bool) -> None:
         _dwm_int(hwnd, DWMWA_BORDER_COLOR, r | (g << 8) | (b << 16))
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- 입력 커서(캐럿) 위치
+ClientToScreen = _proto(user32, "ClientToScreen", wt.BOOL, wt.HWND, ctypes.POINTER(wt.POINT))
+ole32 = ctypes.WinDLL("ole32")
+oleacc = ctypes.WinDLL("oleacc")
+CoInitializeEx = _proto(ole32, "CoInitializeEx", ctypes.c_long, wt.LPVOID, wt.DWORD)
+CoUninitialize = _proto(ole32, "CoUninitialize", None)
+AccessibleObjectFromWindow = _proto(oleacc, "AccessibleObjectFromWindow", ctypes.c_long,
+                                    wt.HWND, wt.DWORD, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))
+OBJID_CARET = 0xFFFFFFF8
+IID_IAccessible = GUID(0x618736E0, 0x3C3D, 0x11CF, (ctypes.c_ubyte * 8)(0x81, 0x0C, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71))
+
+
+class _VARIANT_VALUE(ctypes.Union):
+    # BRECORD(포인터 2개)가 가장 커서 x64 에서 16바이트, x86 에서 8바이트
+    _fields_ = [("lVal", ctypes.c_long), ("llVal", ctypes.c_longlong), ("rec", ctypes.c_void_p * 2)]
+
+
+class VARIANT(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort),
+                ("r3", ctypes.c_ushort), ("val", _VARIANT_VALUE)]
+
+
+assert ctypes.sizeof(VARIANT) == (24 if ctypes.sizeof(ctypes.c_void_p) == 8 else 16)
+
+
+_ACC_LOCATION = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_long),
+                                   ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_long),
+                                   ctypes.POINTER(ctypes.c_long), VARIANT)
+_RELEASE = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+
+
+GUI_CARETBLINKING = 0x1
+try:
+    SetThreadDpiAwarenessContext = _proto(user32, "SetThreadDpiAwarenessContext", wt.HANDLE, wt.HANDLE)
+    GetWindowDpiAwarenessContext = _proto(user32, "GetWindowDpiAwarenessContext", wt.HANDLE, wt.HWND)
+    LogicalToPhysicalPointForPerMonitorDPI = _proto(user32, "LogicalToPhysicalPointForPerMonitorDPI", wt.BOOL,
+                                                    wt.HWND, ctypes.POINTER(wt.POINT))
+except AttributeError:  # Windows 10 1607 이전
+    SetThreadDpiAwarenessContext = None
+
+
+def _client_to_physical(hwnd, pt: wt.POINT) -> bool:
+    """대상 창의 클라이언트 좌표 → 물리 화면 좌표. DPI 를 모르는 앱은 논리 좌표로 주므로 그 창의 DPI 문맥에서 바꾼다."""
+    if SetThreadDpiAwarenessContext is None:
+        return bool(ClientToScreen(hwnd, ctypes.byref(pt)))
+    old = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd))
+    try:
+        ok = ClientToScreen(hwnd, ctypes.byref(pt))
+    finally:
+        if old:
+            SetThreadDpiAwarenessContext(old)
+    if ok:
+        LogicalToPhysicalPointForPerMonitorDPI(hwnd, ctypes.byref(pt))  # 이미 물리 좌표인 창이면 그대로
+    return bool(ok)
+
+
+def _caret_from_thread(fg, require_visible: bool = True) -> tuple[tuple[int, int, int, int] | None, int | None]:
+    """(시스템 캐럿 사각형, 포커스 창). 메모장 같은 일반 Win32 앱은 여기서 바로 나온다."""
+    tid = GetWindowThreadProcessId(fg, None)
+    info = GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if not tid or not GetGUIThreadInfo(tid, ctypes.byref(info)):
+        return None, None
+    focus = info.hwndFocus or None
+    if info.hwndCaret and (info.flags & GUI_CARETBLINKING or not require_visible):  # 숨은(옛) 캐럿 위치는 쓰지 않음
+        rc = info.rcCaret
+        tl, br = wt.POINT(rc.left, rc.top), wt.POINT(rc.right, rc.bottom)
+        if _client_to_physical(info.hwndCaret, tl) and _client_to_physical(info.hwndCaret, br):
+            if br.y > tl.y:
+                return (tl.x, tl.y, max(br.x, tl.x + 1), br.y), focus
+    return None, focus
+
+
+def _caret_from_msaa(hwnd) -> tuple[int, int, int, int] | None:
+    """접근성(MSAA) 캐럿. Chrome·Edge·VS Code·Office 처럼 시스템 캐럿을 안 쓰는 앱용."""
+    ptr = ctypes.c_void_p()
+    if AccessibleObjectFromWindow(hwnd, OBJID_CARET, ctypes.byref(IID_IAccessible), ctypes.byref(ptr)) != 0 \
+            or not ptr.value:
+        return None
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    try:
+        x, y, w, h = (ctypes.c_long() for _ in range(4))
+        self_child = VARIANT()
+        self_child.vt = 3  # VT_I4, lVal=0 → CHILDID_SELF
+        hr = _ACC_LOCATION(vtbl[22])(ptr, ctypes.byref(x), ctypes.byref(y), ctypes.byref(w), ctypes.byref(h),
+                                     self_child)
+        if hr != 0 or (x.value == 0 and y.value == 0) or h.value <= 0:
+            return None
+        return x.value, y.value, x.value + max(w.value, 1), y.value + h.value
+    finally:
+        _RELEASE(vtbl[2])(ptr)
+
+
+def _on_some_monitor(rect) -> bool:
+    l, t, r, b = rect
+    return bool(MonitorFromPoint(wt.POINT(l, b - 1), 0))  # MONITOR_DEFAULTTONULL
+
+
+class _CaretWorker:
+    """캐럿 조회 전용 스레드(COM 은 한 번만 초기화해 재사용).
+
+    UI Automation·접근성 조회는 대상 앱에 요청을 보내므로 앱이 느리거나 멈추면 오래 걸린다. 호출 쪽은 시간 제한까지만
+    기다리고, 늦게 끝난 조회는 버린다(그래도 대상 앱의 접근성 준비는 끝나 있어 다음 번은 빨라진다).
+    """
+
+    def __init__(self):
+        self._jobs: "queue.Queue" = queue.Queue()
+        self.busy = False
+        self._thread = threading.Thread(target=self._run, name="caret", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        hr = CoInitializeEx(None, 0x0)  # COINIT_MULTITHREADED (UI Automation 클라이언트 권장)
+        com_ok = hr in (0, 1)
+        from . import uia
+        while True:
+            fg, box = self._jobs.get()
+            self.busy = True
+            rect = None
+            try:
+                rect, focus = _caret_from_thread(fg)          # 1) 시스템 캐럿(메모장 등): 즉시
+                if rect is None and com_ok:
+                    rect = uia.caret_rect_uia()                # 2) UI Automation(Chrome·Edge·VS Code 등)
+                if rect is None and com_ok:
+                    for target in dict.fromkeys(h for h in (focus, fg) if h):
+                        rect = _caret_from_msaa(target)        # 3) 접근성(MSAA)
+                        if rect:
+                            break
+                if rect and not _on_some_monitor(rect):
+                    rect = None
+            except Exception:  # noqa: BLE001  대상 앱이 이상한 값을 줘도 창은 열려야 한다
+                log.debug("캐럿 조회 실패", exc_info=True)
+                rect = None
+            box[0] = rect
+            box[1].set()
+            self.busy = False
+
+    def query(self, fg, timeout: float):
+        box = [None, threading.Event()]
+        self._jobs.put((fg, box))
+        box[1].wait(timeout)
+        return box[0]
+
+
+_caret_worker: _CaretWorker | None = None
+
+
+def caret_rect(fg, timeout: float = 0.25) -> tuple[int, int, int, int] | None:
+    """앞 창의 텍스트 입력 커서 화면 좌표(left, top, right, bottom). 찾지 못하면 None."""
+    global _caret_worker
+    if not fg:
+        return None
+    rect, _focus = _caret_from_thread(fg)  # 가장 흔한 경우는 스레드 전환 없이 바로
+    if rect and _on_some_monitor(rect):
+        return rect
+    if _caret_worker is None:
+        _caret_worker = _CaretWorker()
+    if _caret_worker.busy:
+        return None  # 앞 조회가 아직 안 끝남(대상 앱이 멈춤): 기다리지 않고 가운데에 띄운다
+    return _caret_worker.query(fg, timeout)
+
+
+def work_area_at(x: int, y: int) -> tuple[int, int, int, int] | None:
+    mon = MonitorFromPoint(wt.POINT(x, y), 2)  # MONITOR_DEFAULTTONEAREST
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if not mon or not GetMonitorInfoW(mon, ctypes.byref(info)):
+        return None
+    r = info.rcWork
+    return r.left, r.top, r.right, r.bottom
 
 
 # ---------------------------------------------------------------- 모니터

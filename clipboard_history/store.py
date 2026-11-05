@@ -107,10 +107,14 @@ class Store:
     # ---- 쓰기 ----
     def add(self, text: str, source: str | None = None, now: float | None = None, *,
             kind: str = "text", formats: dict[str, bytes] | None = None, thumb: bytes | None = None,
-            meta: dict | None = None, identity: bytes | None = None) -> tuple[Entry, bool]:
+            meta: dict | None = None, identity: bytes | None = None, bump: bool = True,
+            follow_up: bool = False) -> tuple[Entry, bool]:
         """저장하고 (항목, 새 항목 여부) 를 돌려준다. 같은 내용이면 시각만 갱신한다.
 
         identity: 중복 판별에 쓸 바이트(이미지 원본 등). 없으면 text 로 판별한다.
+        bump: False 면 같은 복사의 후속 갱신으로 보고 복사 횟수를 늘리지 않는다.
+        follow_up: 같은 앱이 방금 올린 같은 내용의 후속 갱신(엑셀이 닫히며 다시 올림 등)이면, 형식이 더 적은
+            묶음으로 덮어쓰지 않는다. 독립된 새 복사는 항상 새 묶음으로 바꾼다.
         """
         now = time.time() if now is None else now
         if identity is not None:
@@ -126,12 +130,22 @@ class Store:
             ).fetchone()
             if row:
                 eid, created, count, pinned, had_payload = row
+                if follow_up and payload is not None and had_payload and formats is not None:
+                    # 형식이 더 적은 묶음으로 덮어쓰지 않는다(엑셀은 통합 문서를 닫을 때 텍스트·RTF 만 다시 올린다)
+                    try:
+                        old = self.payload(eid)
+                    except (OSError, ValueError):
+                        old = {}
+                    if old and set(formats) <= set(old) and len(formats) < len(old):
+                        payload = None
+                inc = 1 if bump else 0
                 self.db.execute(
-                    "UPDATE entries SET last_used_at=?, copy_count=copy_count+1, kind=?,"
+                    "UPDATE entries SET last_used_at=?, copy_count=copy_count+?, kind=?,"
                     " source=COALESCE(?, source), payload=COALESCE(?, payload), thumb=COALESCE(?, thumb)"
                     " WHERE id=?",
-                    (now, kind, source, payload, thumb_blob, eid),
+                    (now, inc, kind, source, payload, thumb_blob, eid),
                 )
+                count += inc - 1
                 source = source or self.db.execute("SELECT source FROM entries WHERE id=?", (eid,)).fetchone()[0]
                 return Entry(eid, text, created, now, count + 1, bool(pinned), source, kind, meta or {},
                              bool(had_payload or payload)), False
@@ -151,10 +165,11 @@ class Store:
     def formats_for(self, e: "Entry") -> dict[str, bytes]:
         """다시 복사할 때 클립보드에 넣을 형식 묶음."""
         if e.kind == "text":
-            formats = {"CF_UNICODETEXT": e.text.encode("utf-16-le", "surrogatepass") + b"\x00\x00"}
-            if e.has_payload:
-                formats.update(self.payload(e.id))
-            return formats
+            text_fmt = {"CF_UNICODETEXT": e.text.encode("utf-16-le", "surrogatepass") + b"\x00\x00"}
+            payload = self.payload(e.id) if e.has_payload else {}
+            if "CF_UNICODETEXT" in payload:
+                return payload  # 원래 앱이 넣은 순서 그대로
+            return {**text_fmt, **payload}
         if e.kind == "files":
             return {"CF_HDROP": build_hdrop(e.text.split("\n"))}
         return self.payload(e.id)  # 이미지: CF_DIB(+PNG)

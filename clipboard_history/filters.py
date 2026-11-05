@@ -23,6 +23,7 @@ class Snapshot:
     formats: dict = field(default_factory=dict)
     thumb: bytes | None = None
     meta: dict = field(default_factory=dict)
+    incomplete: bool = False  # 원래 앱이 일부 형식을 아직 만들어 주지 못함(잠시 뒤 다시 읽을 대상)
 
 
 def should_store(snap: Snapshot, exclude_processes: Iterable[str],
@@ -60,6 +61,11 @@ class SearchIndex:
 
     def __init__(self, entries: Iterable[Entry] = ()):
         self._items: dict[int, tuple[Entry, str]] = {}
+        for e in entries:
+            self.put(e)
+
+    def replace_all(self, entries: Iterable[Entry]) -> None:
+        self._items.clear()
         for e in entries:
             self.put(e)
 

@@ -7,7 +7,7 @@
   │ ▌첫 줄 미리보기(형광펜)     │ 미리보기 카드  │ │  목록 400px | 카드(종이 한 장)
   │   14:22 · 1,234자 · chrome │               │ │
   │ 어제 ...                   └───────────────┘ │
-  │ 1,234개 보관 · 90일     ↵ 복사 ⇧↵ 붙여넣기 … │  바닥 40px
+  │ 1,234개 보관 · 90일   ↵ 붙여넣기 ⇧↵ 복사만 … │  바닥 40px
   └──────────────────────────────────────────────┘
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ TITLE = "클립보드 기록"
 RESULT_LIMIT = 500
 PREVIEW_LIMIT = 20_000  # 줄바꿈 없는 긴 글은 Tk Text 줄바꿈 계산이 느려서 미리보기는 앞부분만
 MARK_LIMIT = 200
-KEYS = (("↵", "복사"), ("⇧ ↵", "붙여넣기"), ("Ctrl P", "고정"), ("Ctrl D", "삭제"), ("Esc", "닫기"))
+KEYS = (("↵", "붙여넣기"), ("⇧ ↵", "복사만"), ("Ctrl P", "고정"), ("Ctrl D", "삭제"), ("Esc", "닫기"))
 ICON_SEARCH, ICON_PIN, ICON_FOLDER, ICON_PAGE, ICON_PHOTO = "", "", "", "", ""
 
 
@@ -105,7 +105,7 @@ class SearchWindow:
                  on_delete: Callable[[Entry], None],
                  on_pin: Callable[[Entry], None],
                  load_thumb: Callable[[int], bytes | None] | None = None,
-                 icon_path: str | None = None, retention_days: int = 90):
+                 icon_path: str | None = None, retention_days: int = 90, position_mode: str = "caret"):
         self.root = root
         self.index = index
         self.on_copy = on_copy
@@ -113,6 +113,7 @@ class SearchWindow:
         self.on_pin = on_pin
         self.load_thumb = load_thumb or (lambda _id: None)
         self.retention_days = retention_days
+        self.position_mode = position_mode
         self.results: list[Entry] = []
         self.rows: list[tuple] = []        # ("header", 라벨, y) / ("entry", 결과 인덱스, y)
         self.sel = 0
@@ -124,6 +125,8 @@ class SearchWindow:
         self._flash_job = None
         self._menu_open = False
         self._thumbs: dict[tuple[int, str], tk.PhotoImage] = {}
+        self._dirty = True
+        self._styled = None
         self.pal: Palette | None = None
 
         self.s = max(1.0, root.winfo_fpixels("1i") / 96)
@@ -239,8 +242,8 @@ class SearchWindow:
 
         self.menu = tk.Menu(self.root, tearoff=False, bg=pal.sheet, fg=pal.ink, activebackground=pal.row_selected,
                             activeforeground=pal.ink, bd=0, relief="flat", font=self.f_meta)
-        self.menu.add_command(label="복사", command=lambda: self._copy(False))
-        self.menu.add_command(label="복사 후 붙여넣기", command=lambda: self._copy(True))
+        self.menu.add_command(label="붙여넣기", command=lambda: self._copy(True))
+        self.menu.add_command(label="복사만", command=lambda: self._copy(False))
         self.menu.add_command(label="고정 / 고정 해제", command=self._pin)
         self.menu.add_separator()
         self.menu.add_command(label="삭제", command=self._delete)
@@ -250,7 +253,7 @@ class SearchWindow:
         self.list.bind("<Motion>", self._on_motion)
         self.list.bind("<Leave>", lambda e: self._set_hover(-1))
         self.list.bind("<Button-1>", self._on_click)
-        self.list.bind("<Double-Button-1>", lambda e: self._copy(False))
+        self.list.bind("<Double-Button-1>", lambda e: self._copy(True))
         self.list.bind("<Button-3>", self._on_context)
         self.root.geometry(f"{W}x{H}")
 
@@ -265,9 +268,9 @@ class SearchWindow:
             w.bind("<Up>", lambda e: self._move(-1))
             w.bind("<Next>", lambda e: self._move(6))
             w.bind("<Prior>", lambda e: self._move(-6))
-            w.bind("<Return>", lambda e: self._copy(False))
-            w.bind("<KP_Enter>", lambda e: self._copy(False))
-            w.bind("<Shift-Return>", lambda e: self._copy(True))
+            w.bind("<Return>", lambda e: self._copy(True))       # 바로 붙여넣기
+            w.bind("<KP_Enter>", lambda e: self._copy(True))
+            w.bind("<Shift-Return>", lambda e: self._copy(False))  # 클립보드에 복사만
             w.bind("<Escape>", lambda e: self._escape())
             for k in ("p", "P"):
                 w.bind(f"<Control-{k}>", lambda e: self._pin())
@@ -281,34 +284,42 @@ class SearchWindow:
     def _own_hwnd(self):
         return win32.GetAncestor(self.root.winfo_id(), win32.GA_ROOT)
 
-    def show(self, prev_hwnd=None) -> None:
+    def show(self, prev_hwnd=None, caret=None, keep_target: bool = False) -> None:
+        was_visible = self.visible()
         own = self._own_hwnd()
-        if prev_hwnd and prev_hwnd != own:
-            self.prev_hwnd = prev_hwnd   # 창이 이미 떠 있을 때 단축키를 다시 눌러도 원래 대상 창을 유지
-        elif not self.visible():
+        if keep_target and was_visible:
+            pass                          # 창이 떠 있을 때 단축키를 다시 누름: 원래 붙여넣을 창 유지
+        elif prev_hwnd and prev_hwnd != own:
             self.prev_hwnd = prev_hwnd
+        else:
+            self.prev_hwnd = None         # 트레이·CLI 로 열면 붙여넣을 대상 없음(복사만)
         pal = theme.current_palette()
         if pal is not self.pal:
             q = self.query.get()
             self._build(pal)
             self.query.set(q)
-        self.query.set("") if not self.visible() else None
-        self.scroll = 0
-        self.refresh()
-        area = win32.work_area_at_cursor()
-        if area:
-            l, t, r, b = area
-        else:
-            l, t, r, b = 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x = l + (r - l - self.W) // 2
-        y = t + max(self.px(24), int((b - t) * 0.18))
-        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        if not was_visible:
+            if self.query.get():
+                self.query.set("")          # 새로 열 때는 빈 검색부터
+                self._dirty = True
+            if self._pending:
+                self.root.after_cancel(self._pending)
+                self._pending = None
+            if self._dirty or self.sel != 0 or self.scroll:
+                self.scroll = 0
+                self.refresh()              # 기록이 바뀌었거나 위치가 달라졌을 때만 다시 계산
+                self._dirty = False
+        if not was_visible or caret:
+            x, y = self._position(caret)
+            self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
         self.root.deiconify()
         self.root.lift()
         self.root.update_idletasks()
         own = self._own_hwnd()
         if own:
-            win32.style_popup(own, self.pal.frame, self.pal.dark)
+            if self._styled != own:  # 창 모양(둥근 모서리 등)은 창마다 한 번만
+                win32.style_popup(own, self.pal.frame, self.pal.dark)
+                self._styled = own
             win32.force_foreground(own)
         self.root.focus_force()
         self.entry.focus_set()
@@ -323,6 +334,20 @@ class SearchWindow:
             self.root.attributes("-topmost", True)
         else:
             self.root.attributes("-topmost", False)
+
+    def _position(self, caret) -> tuple[int, int]:
+        """입력 커서 근처(아래, 모자라면 위). 커서를 모르면 마우스가 있는 화면의 위쪽 가운데."""
+        if caret and self.position_mode == "caret":
+            area = win32.work_area_at((caret[0] + caret[2]) // 2, caret[3] - 1)
+            if area:
+                return theme.place_near_caret(caret, area, (self.W, self.H), gap=self.px(8),
+                                              margin=self.px(8), inset=self.px(Size.PAD + 46))
+        area = win32.work_area_at_cursor()
+        if area:
+            l, t, r, b = area
+        else:
+            l, t, r, b = 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        return l + (r - l - self.W) // 2, t + max(self.px(24), int((b - t) * 0.18))
 
     def hide(self) -> None:
         self.root.withdraw()
@@ -368,6 +393,21 @@ class SearchWindow:
     def data_changed(self) -> None:
         if self.visible():
             self.refresh(keep_selection=True)
+        else:
+            self._dirty = True  # 숨어 있을 때는 다음에 열 때 한 번만 다시 계산
+
+    def prewarm(self) -> None:
+        """화면 밖에서 한 번 띄웠다 숨긴다(처음 열 때의 창 생성·그리기 비용을 미리 치름)."""
+        self.refresh()
+        self._dirty = False
+        self.root.geometry(f"{self.W}x{self.H}+-32000+-32000")
+        self.root.deiconify()
+        self.root.update()
+        own = self._own_hwnd()
+        if own:
+            win32.style_popup(own, self.pal.frame, self.pal.dark)
+            self._styled = own
+        self.root.withdraw()
 
     def refresh(self, keep_selection: bool = False) -> None:
         if self._pending:
@@ -710,3 +750,4 @@ class SearchWindow:
             self._select(min(idx, len(self.results) - 1))
             self.flash("삭제했습니다")
         return "break"
+

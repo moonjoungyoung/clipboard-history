@@ -158,3 +158,36 @@ class MiscTest(TempDirCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlacementTest(unittest.TestCase):
+    """입력 커서 근처 배치: 아래 → 모자라면 위로 뒤집기, 좌우는 화면 안으로."""
+    AREA = (0, 0, 1920, 1040)      # 작업 표시줄을 뺀 작업 영역
+    SIZE = (760, 484)
+
+    def place(self, caret, area=AREA, size=SIZE):
+        from clipboard_history.theme import place_near_caret
+        return place_near_caret(caret, area, size, gap=8, margin=8, inset=58)
+
+    def test_below_caret(self):
+        self.assertEqual(self.place((400, 200, 401, 220)), (342, 228))
+
+    def test_flips_above_near_bottom(self):
+        x, y = self.place((400, 900, 401, 920))
+        self.assertEqual(y, 900 - 8 - 484)          # 커서 위로
+        self.assertLessEqual(y + 484, 900)           # 커서를 가리지 않음
+
+    def test_pushed_in_from_right_and_left(self):
+        self.assertEqual(self.place((1900, 200, 1901, 220))[0], 1920 - 8 - 760)
+        self.assertEqual(self.place((10, 200, 11, 220))[0], 8)
+
+    def test_second_monitor_offsets(self):
+        area = (-1920, 0, 0, 1080)                   # 왼쪽 보조 모니터
+        x, y = self.place((-100, 1000, -99, 1020), area=area)
+        self.assertEqual(x, -8 - 760)
+        self.assertEqual(y, 1000 - 8 - 484)
+
+    def test_no_room_either_side_stays_on_screen(self):
+        x, y = self.place((400, 300, 401, 320), area=(0, 0, 1280, 600))
+        self.assertGreaterEqual(y, 8)
+        self.assertLessEqual(y + 484, 600 - 8)

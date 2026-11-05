@@ -26,6 +26,7 @@ DEFAULT_EXCLUDE_PROCESSES = [
 class Config:
     retention_days: int = 90          # 마지막으로 복사한 지 이 기간이 지난 항목은 삭제(고정 항목 제외)
     hotkey: str = "win+alt+v"         # 검색 창 단축키
+    popup_position: str = "caret"     # caret: 입력 커서 근처 / center: 화면 위쪽 가운데
     max_chars: int = 1_000_000        # 이보다 긴 텍스트는 저장하지 않음
     max_bytes: int = 64 * 1024 * 1024  # 이미지·서식 한 형식이 이보다 크면 저장하지 않음
     recent_menu_count: int = 15       # 트레이 '최근 항목' 개수
@@ -92,6 +93,11 @@ def load_config(path: Path | None = None) -> tuple[Config, list[str]]:
         cfg.hotkey = hk.strip().lower()
     else:
         warnings.append(f"hotkey 는 문자열이어야 합니다. 기본값 {cfg.hotkey} 사용")
+    pos = raw.get("popup_position", cfg.popup_position)
+    if pos in ("caret", "center"):
+        cfg.popup_position = pos
+    else:
+        warnings.append("popup_position 은 'caret' 또는 'center' 입니다. 기본값 caret 사용")
     unknown = set(raw) - set(asdict(cfg))
     if unknown:
         warnings.append("알 수 없는 설정 무시: " + ", ".join(sorted(unknown)))
